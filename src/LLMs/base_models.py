@@ -1,3 +1,4 @@
+# base_models.py
 from src.get_dotenv import config
 from langchain_openai import ChatOpenAI
 
@@ -10,4 +11,14 @@ router_model = ChatOpenAI(
     top_p=0.5,
     max_retries=2
 )
+
+agent_model = ChatOpenAI(
+    model = config.AGENT_MODEL,
+    base_url = config.LLM_URL,
+    api_key = config.LLM_API_KEY,
+    temperature = 0.1,
+    top_p=0.5,
+    max_retries=2
+)
+
 

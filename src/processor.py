@@ -1,14 +1,16 @@
-import json5
+# processor.py
 import frontmatter
 import importlib.util
 import inspect
 from pathlib import Path
-from typing import Annotated, Literal, TypedDict, List, Dict, Any
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from typing import Annotated, Literal, TypedDict, Dict, Any
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import BaseTool
-from langgraph.graph import StateGraph, END, add_messages
-from langgraph.prebuilt import ToolNode
+from langgraph.graph import StateGraph, add_messages
 from .LLMs.router import RouterModel
+from .LLMs.agent import AgentModel
+from .utils.logger import logger
+from collections import defaultdict
 
 
 # ==========================================
@@ -19,22 +21,26 @@ class SkillLoader:
         self.base_dir = Path(base_dir)
         # 用于放注册在类中的skill
         self.registry: Dict[str, Dict[str, Any]] = {}
-        # 汇总所有加载到的工具
-        self.all_tools: List[BaseTool] = []
         self.load_all_skills()
 
     def load_all_skills(self):
         """遍历物理文件夹，动态解析 SKILL.md 与 tools.py"""
         if not self.base_dir.exists():
-            print(f"[警告] 技能目录 {self.base_dir.resolve()} 不存在，请先创建！")
+            logger.error(f"[SkillLoader] 技能目录 {self.base_dir.resolve()} 不存在，请先创建！")
             return
 
         for skill_folder in self.base_dir.iterdir():
             if not skill_folder.is_dir():
+                logger.warning(f'[SkillLoader] 在skills文件夹中发现非文件夹对象，请检查skills文件夹中的文件结构是否符合要求')
                 continue
-            # 各个skill文件夹里面必须至少要有SKILL.md，
+            # 各个skill文件夹里面必须至少要有SKILL.md
             md_path = skill_folder / "SKILL.md"
-            tools_path = skill_folder / "tools.py"
+            # 各个可选文件夹
+            scripts_path = skill_folder / 'scripts'
+            tools_path = scripts_path / 'tools.py'
+            # TODO下面这两个暂时都还没有涉及，没有做相应模块
+            references_path = skill_folder / 'references'
+            assets_path = skill_folder / 'assets'
 
             if md_path.is_file():
                 # 1. 解析 YAML Frontmatter 和 SOP
@@ -46,17 +52,20 @@ class SkillLoader:
                 # 2. 动态加载该 Skill 专属的 tools.py (如果存在)
                 skill_tools = []
                 if tools_path.is_file():
+                    # IMPORTANT 当前的设计中所有的工具应该都在一个tools.py脚本下，之后也许可以优化
                     # 使用 importlib 动态执行外部 py 文件
+                    # spec 对象包含了该文件的路径、加载器类型等信息。它还没读取文件内容，只是确认了“文件在哪儿”以及“怎么读”。
                     spec = importlib.util.spec_from_file_location(f"{skill_name}_tools", tools_path)
                     if spec and spec.loader:
+                        # 根据刚才那份spec，在内存中创建一个全新的、空的 Python 模块对象。
                         module = importlib.util.module_from_spec(spec)
+                        # 真正读取 tools.py 里的代码，并在刚才创建的 module 命名空间里执行这些代码
                         spec.loader.exec_module(module)
 
                         # 扫描模块中所有被 @tool 装饰的 LangChain 工具
                         for name, obj in inspect.getmembers(module):
                             if isinstance(obj, BaseTool):
                                 skill_tools.append(obj)
-                                self.all_tools.append(obj)
 
                 # 3. 注册到内存
                 self.registry[skill_name] = {
@@ -66,72 +75,141 @@ class SkillLoader:
                 }
 
                 tool_names = [t.name for t in skill_tools]
-                print(f"[加载完毕] Skill: {skill_name} | 挂载专属工具: {tool_names}")
+                logger.info(f"[SkillLoader] Skill: {skill_name} | 挂载专属工具: {tool_names}")
 
 
 # ==========================================
 # 2. 状态与节点定义 (LangGraph)
 # ==========================================
+# 初始化依赖对象（我记得import是把脚本从上到下全部扫一遍，所以我即使在main里不导入这俩依赖应该也没事吧）
+skill_manager = SkillLoader()
+router_model = RouterModel(skill_manager.registry)
+MAX_RETRY = 2
+
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
-
-    # 1. 物理边界：工作区目录 (Workspace)
-    # 前端只需在服务器上建一个临时文件夹（UUID命名），把用户上传的 1个、2个 甚至 10个文件全扔进去。
-    # Agent 只认这一个文件夹路径。
+    # Agent有权限触碰的文件夹
     workspace_dir: str
 
-    # 2. 逻辑载荷：通用数据字典 (Payload)
+    # 如果除了文件之外还有结构化的输入，可以从这里传入
     # 这是一个兜底的设计。如果前端不仅传了文件，还传了 {"客户层级": "VIP", "开户时间": "2026-02-27"}
-    # 统统装进这个字典里，引擎本身不需要知道里面有什么，按需提取。
+    # TODO Agent应该具备在没获取所需的payload的时候调用工具主动向用户索要，在写工具的时候要有谱
     payload: Dict[str, Any]
-
-    # 3. 系统控制流
+    # 当前选择的SKILL
     selected_skill: str
+    # 工具节点重试记录
+    tool_error_counts: defaultdict[str, int]
 
 def router_node(state: AgentState):
-    """【意图识别】：仅依据 Description 路由"""
-    print("\n[节点: Router] 正在通过 Skill Description 识别意图...")
+    """开始节点，意图识别，仅更新 selected_skill，不污染 messages 列表"""
+    logger.info("[Router] 正在通过 Skill Description 识别意图...")
     user_query = state["messages"][0].content
     chosen_skill = router_model.route(user_query)
-    print(f"-> 命中 Skill: [{chosen_skill}]")
+    logger.info(f"[Router] 选中 Skill: [{chosen_skill}]")
+    # 更新AgentState
+    return {"selected_skill": chosen_skill}
 
-    # 注入该 Skill 的 SOP
-    sop_content = skill_manager.registry.get(chosen_skill, {}).get("sop_prompt", "你是一个得力的助手。")
-    system_msg = SystemMessage(content=sop_content)
 
-    return {"messages": [system_msg], "selected_skill": chosen_skill}
+def dynamic_tools_node(state: AgentState):
+    """【执行器】：根据选定的 Skill，动态拉取专属工具并执行"""
+    logger.info("[Tools] 正在绑定Skill专属工具...")
 
+    selected_skill = state.get("selected_skill")
+    tool_error_counts = state['tool_error_counts'].copy()
+    # 动态获取当前 Skill 的专属工具
+    current_skill_tools = skill_manager.registry.get(selected_skill, {}).get("tools", [])
+
+    # 构建 O(1) 的查找字典
+    tool_map = {t.name: t for t in current_skill_tools}
+
+    last_msg = state["messages"][-1]
+    tool_outputs = []
+
+    # 遍历大模型请求的所有工具调用
+    # 大模型的工具请求Message对象会有tool_calls属性
+    for tool_call in last_msg.tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
+        logger.info(f'[Tools] 智能体请求执行工具 {tool_name} ')
+
+        if tool_name in tool_map:
+            # 找到对应工具并执行
+            tool_instance = tool_map[tool_name]
+            try:
+                result = tool_instance.invoke(tool_args)
+                tool_outputs.append(
+                    ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_call["id"])
+                )
+                logger.info(f'[Tools] 工具 {tool_name} 成功执行')
+                # 成功调用，重试计数清零
+                tool_error_counts[tool_name] = 0
+            except Exception as e:
+                retry = tool_error_counts[tool_name]
+                if retry < MAX_RETRY:
+                    logger.warning(f'[Tools] 工具 {tool_name} 执行异常，执行第 {retry+1} 次重试')
+                    tool_outputs.append(
+                        ToolMessage(content=f"工具执行异常: {str(e)}，请检查问题后尝试重新调用", name=tool_name, tool_call_id=tool_call["id"])
+                    )
+                    tool_error_counts[tool_name] +=1
+                else:
+                    logger.error(f'[Tools] 工具 {tool_name} 执行错误！执行 {MAX_RETRY} 次重试依然失败，要求智能体放弃该工具')
+                    tool_outputs.append(
+                        ToolMessage(content=f"工具连续出错！请放弃调用该工具！放弃调用该工具！基于之前所得所有信息执行下一步！", name=tool_name,
+                                    tool_call_id=tool_call["id"])
+                    )
+        else:
+            # 安全兜底：如果模型幻觉调用了不在当前 Skill 里的工具，直接拦截并报错回传
+            retry_exception = tool_error_counts['exception']
+            if retry_exception < MAX_RETRY:
+                error_msg = f"非法调用：当前技能 [{selected_skill}] 中不存在工具 '{tool_name}'，请检查问题后尝试重新调用。"
+                logger.error(f'[Tools] {error_msg}')
+                tool_outputs.append(
+                    ToolMessage(content=error_msg, name=tool_name, tool_call_id=tool_call["id"])
+                )
+                tool_error_counts['exception'] +=1
+            else:
+                logger.error(f'[Tools] 工具节点执行错误！执行 {MAX_RETRY} 次重试依然调用了不存在的工具，要求智能体放弃该工具')
+                tool_outputs.append(
+                    ToolMessage(content=f"工具连续出错！请放弃调用该工具！放弃调用该工具！基于之前所得所有信息执行下一步！",
+                                name=tool_name,
+                                tool_call_id=tool_call["id"])
+                )
+
+    # 增量更新状态
+    return {"tool_error_counts":tool_error_counts, "messages": tool_outputs}
 
 def llm_agent_node(state: AgentState):
-    """【智能体大脑】：GLM-5 思考逻辑"""
-    print("\n[节点: LLM Agent] GLM-5 正在基于 SOP 思考...")
+    """【智能体大脑】：动态拼装标准上下文，执行工具调度"""
+    print("[Agent] 正在基于 SOP 思考...")
 
-    history = [m for m in state["messages"] if isinstance(m, (AIMessage, HumanMessage)) or m.type == "tool"]
-    last_msg = history[-1] if history else None
+    selected_skill = state.get("selected_skill")
 
-    # TODO======= [模拟 LLM 工具调用逻辑] =======
-    if isinstance(last_msg, HumanMessage):
-        print("-> LLM 决定调用工具：extract_text_from_file")
-        mock_ai_msg = AIMessage(content="", tool_calls=[
-            {"name": "extract_text_from_file", "args": {"file_path": state["file_path"]}, "id": "call_1"}])
-        return {"messages": [mock_ai_msg]}
-    elif getattr(last_msg, 'name', '') == 'extract_text_from_file':
-        print("-> LLM 决定并行调用工具：check_fee_rate & check_risk_warning")
-        mock_ai_msg = AIMessage(content="", tool_calls=[
-            {"name": "check_fee_rate", "args": {"text": last_msg.content}, "id": "call_2"},
-            {"name": "check_risk_warning", "args": {"text": last_msg.content}, "id": "call_3"}
-        ])
-        return {"messages": [mock_ai_msg]}
-    else:
-        print("-> LLM 收集齐结果，生成最终 JSON5 报告")
-        messy_json5_from_llm = """{
-            // 这是 GLM-5 的输出结果
-            'status': "违规", 
-            risk_level: '高风险',
-            reason: "费率过低且缺失风险揭示语",
-        }"""
-        return {"messages": [AIMessage(content=messy_json5_from_llm)]}
-    # ========================================
+    # 1. 获取该 Skill 的 SOP
+    sop_content = skill_manager.registry.get(selected_skill, {}).get("sop_prompt", "你是一个得力的助手。")
+
+    # 2. 核心：将 workspace_dir 和 payload 作为系统级的环境变量，注入到 SOP 的末尾
+    # 这样 Agent 既知道 SOP，又知道去哪里找文件，且完全不需要用户在提问中写明路径
+    sop_context = (
+        f"【任务操作手册】\n"
+        f"{sop_content}\n\n"
+        f"【系统环境变量】\n"
+        f"- 当前工作目录 (Workspace): {state.get('workspace_dir', '未知')}\n"
+        f"- 附加业务数据 (Payload): {state.get('payload', {})}"
+    )
+    system_msg = HumanMessage(content=sop_context)
+
+    # 3. 提取历史消息 (过滤掉可能混入的非标准 Message)，甚至可以排除之前的SKILL SOP的干扰，专注当下任务
+    history = [m for m in state["messages"] if isinstance(m, (AIMessage, HumanMessage, ToolMessage))]
+
+    # 4. 强制组装：System 永远在绝对的第一位！
+    messages_for_llm = [system_msg] + history
+
+    # 5. 调用模型
+    agent_model = AgentModel(skill_manager.registry, selected_skill)
+    response = agent_model.work(messages_for_llm)
+
+    # 6. 将模型的输出增量更新回全局状态
+    return {"messages": [response]}
 
 
 def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
@@ -142,59 +220,24 @@ def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
 
 
 # 启动时执行挂载
-skill_manager = SkillLoader()
-router_model = RouterModel(skill_manager.registry)
+def construct_app():
+    # ==========================================
+    # 3. 构建流转图 (ReAct State Machine)
+    # ==========================================
+    # 构建流转图
+    workflow = StateGraph(AgentState)
 
+    workflow.add_node("router", router_node)
+    workflow.add_node("agent", llm_agent_node)
+    # 直接挂载我们手写的动态节点，抛弃 prebuilt.ToolNode
+    workflow.add_node("tools", dynamic_tools_node)
 
-# ==========================================
-# 3. 构建流转图 (ReAct State Machine)
-# ==========================================
-workflow = StateGraph(AgentState)
+    workflow.set_entry_point("router")
+    workflow.add_edge("router", "agent")
+    # 这个should_continue是个函数，会返回结束或者tools的字符串，也即节点名
+    workflow.add_conditional_edges("agent", should_continue)
+    workflow.add_edge("tools", "agent") # 工具执行完切回 Agent
 
-workflow.add_node("router", router_node)
-workflow.add_node("agent", llm_agent_node)
+    skill_agent_app = workflow.compile()
+    return skill_agent_app
 
-# 动态绑定所有扫描到的物理工具
-if skill_manager.all_tools:
-    tool_node = ToolNode(skill_manager.all_tools)
-    workflow.add_node("tools", tool_node)
-    workflow.add_edge("tools", "agent")
-else:
-    # 防止因完全没有配置工具导致图编译失败的兜底
-    def dummy_tools(state):
-        return {"messages": []}
-
-
-    workflow.add_node("tools", dummy_tools)
-    workflow.add_edge("tools", "agent")
-
-workflow.set_entry_point("router")
-workflow.add_edge("router", "agent")
-workflow.add_conditional_edges("agent", should_continue)
-
-skill_agent_app = workflow.compile()
-
-# ==========================================
-# 4. 执行测试
-# ==========================================
-if __name__ == "__main__":
-    print(">>> 启动引擎...\n")
-
-    initial_state = {
-        "messages": [HumanMessage(content="帮我审查一下这两张身份证照片是不是同一个地方拍的。")],
-        "file_path": "/uploads/promo_poster_01.pdf",
-        "selected_skill": ""
-    }
-
-    # 如果找不到真实目录，引擎会安全地空转
-    if not skill_manager.registry:
-        print("请按照结构在本地建立 skills 文件夹后再运行测试！")
-    else:
-        final_state = skill_agent_app.invoke(initial_state)
-
-        print("\n========== [解析后] JSON 报告 ==========")
-        try:
-            parsed_data = json5.loads(final_state["messages"][-1].content)
-            print(json5.dumps(parsed_data, indent=4, ensure_ascii=False))
-        except Exception as e:
-            print(f"解析失败: {e}")
