@@ -8,6 +8,7 @@ import json5
 
 def main(query):
     # 构造完美符合 AgentState 结构的初始状态
+
     initial_state = {
         # 用户只需要说自然语言，不用管路径
         "messages": [HumanMessage(content=query)],

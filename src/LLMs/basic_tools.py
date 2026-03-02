@@ -1,11 +1,12 @@
-from langchain_core.tools import tool
+# basic_tools.py
+from langchain_core.tools import tool, InjectedToolArg
 from typing import Annotated
 import seedir as sd
 from .base_models import router_model
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from pydantic import BaseModel, field_validator, ValidationError
 from ..utils.logger import logger
-
+from ..skill_loader import SkillLoader
 
 
 @tool()
@@ -19,8 +20,19 @@ def check_workspace(
     tree_str = sd.seedir(workspace,printout=False)
     return tree_str
 
-
-def choose_skills():
+# 上下文的Message列表结构是不暴露给LLM的，所以不能作为参数传进去，得在主流程里面管理
+def choose_skills(
+        latest_context: Annotated[list, InjectedToolArg],
+        skill_manager: Annotated[SkillLoader, InjectedToolArg]
+) -> str:
+    """
+    用于选取技能的函数，会为你分配可以用于完成当前任务的技能，从而能依据技能的流程完成任务。
+    总是以下情况调用该工具：
+    1、用户要求完成特定任务时
+    2、你当前的技能无法完成下一步任务时
+    函数将返回完成任务的所需技能
+    :return: 完成任务的所需技能
+    """
     template_prompt_system = """
     <role>
     你是一个严谨的技能挑选者
@@ -34,6 +46,7 @@ def choose_skills():
 
     <output-format>
     你的输出应该是选定的工作流的"name"，注意严禁输出任何无关的内容，只输出单个工作流的"name"字段
+    比如我们选定的skill的"name"字段为"test"，则直接输出"test"
     </output-format>
     """
 
@@ -68,7 +81,7 @@ def choose_skills():
 
             return SkillName
 
-        def invoke_prompt(self, latest_context):
+        def invoke_prompt(self, latest_context: list):
             # 这里之后有拓展成RAG的空间
             skills_list = []
             for name in self.registry:
@@ -77,12 +90,12 @@ def choose_skills():
             prompt = template_prompt.invoke(
                 {
                     'skills': skills,
-                    'user_input': latest_context
+                    'latest_context': latest_context
                 }
             )
             return prompt
 
-        def choose(self, latest_context: str, max_retries: int = 2) -> str:
+        def choose(self, latest_context: list, max_retries: int = 2) -> str:
             """
             执行SKILL选择判别，包含 Pydantic 校验和重试机制。
             最大尝试次数 = 1(首次) + max_retries = 3 次。
@@ -120,15 +133,45 @@ def choose_skills():
                     logger.error(f"[choose_skills] LLM 调用发生未知异常: {e}")
                     return ""  # 触发降级
             return ""
-    # 只好这里导入了，看上去有点不优雅
-    from ..processor import skill_manager
     skill_choose_model = SkillChooseModel(skill_manager.registry)
     # 构造最近的会话记录
-
-    skill_choose_model.choose()
-
-
-def ask_user():
+    res = skill_choose_model.choose(latest_context)
+    return res
 
 
-def generate_skill():
+def ask_user(
+        query: Annotated[str, "你向用户询问的问题或者寻求确认的问题，应该总是分点询问"]
+) -> str:
+    """
+    当你对当前任务的有问题时，严禁自己猜测！总是调用该函数向用户确认。
+    在如下情况总是调用该函数：
+    1、用户对任务的描述存在歧义时
+    2、用户没有提供完整的任务参数时
+    3、用户的任务描述与workspace中的任务资料不吻合时
+    注意，如果用户的回答仍然不能解答你的问题，可以频繁连续调用该函数，以对任务有一个清晰明确的认知
+    :return: 返回用户的回答
+    """
+    # TODO这个地方之后需要使用langgraph interrupt机制才行，现在也就单机demo不会有问题罢了
+    front_prompt = f"""
+
+------------------------------------
+[智能体] 希望与您对齐任务需求：
+{query}
+
+------------------------------------
+请给他一些指示：
+"""
+    user_res = input(front_prompt)
+    return user_res
+
+
+def generate_skill(
+
+):
+    """
+    工具暂时无效，禁止使用该工具
+    :return:
+    """
+    # TODO这个模块太大了，先把SKILL应用模块开发完再来动这个SKILL开发模块
+    pass
+

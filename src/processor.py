@@ -1,97 +1,32 @@
 # processor.py
-import frontmatter
-import importlib.util
-import inspect
-from pathlib import Path
 from typing import Annotated, Literal, TypedDict, Dict, Any
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
-from langchain_core.tools import BaseTool
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langgraph.graph import StateGraph, add_messages
-from .LLMs.agent import AgentModel
+from .LLMs.basic_tools import generate_skill, ask_user, choose_skills, check_workspace
+from .LLMs.base_models import agent_model
 from .utils.logger import logger
 from collections import defaultdict
-
-
-# ==========================================
-# 1. Skill 解析器 (核心：动态加载物理文件与工具)
-# ==========================================
-class SkillLoader:
-    def __init__(self, base_dir: str = "skills"):
-        self.base_dir = Path(base_dir)
-        # 用于放注册在类中的skill
-        self.registry: Dict[str, Dict[str, Any]] = {}
-        self.load_all_skills()
-
-    def load_all_skills(self):
-        """遍历物理文件夹，动态解析 SKILL.md 与 tools.py"""
-        if not self.base_dir.exists():
-            logger.error(f"[SkillLoader] 技能目录 {self.base_dir.resolve()} 不存在，请先创建！")
-            return
-
-        for skill_folder in self.base_dir.iterdir():
-            if not skill_folder.is_dir():
-                logger.warning(f'[SkillLoader] 在skills文件夹中发现非文件夹对象，请检查skills文件夹中的文件结构是否符合要求')
-                continue
-            # 各个skill文件夹里面必须至少要有SKILL.md
-            md_path = skill_folder / "SKILL.md"
-            # 各个可选文件夹
-            scripts_path = skill_folder / 'scripts'
-            tools_path = scripts_path / 'tools.py'
-            # TODO下面这两个暂时都还没有涉及，没有做相应模块
-            references_path = skill_folder / 'references'
-            assets_path = skill_folder / 'assets'
-
-            if md_path.is_file():
-                # 1. 解析 YAML Frontmatter 和 SOP
-                post = frontmatter.load(md_path)
-                skill_name = post.metadata.get("name", skill_folder.name)
-                skill_desc = post.metadata.get("description", "")
-                sop_body = post.content.strip()
-
-                # 2. 动态加载该 Skill 专属的 tools.py (如果存在)
-                skill_tools = []
-                if tools_path.is_file():
-                    # IMPORTANT 当前的设计中所有的工具应该都在一个tools.py脚本下，之后也许可以优化
-                    # 使用 importlib 动态执行外部 py 文件
-                    # spec 对象包含了该文件的路径、加载器类型等信息。它还没读取文件内容，只是确认了“文件在哪儿”以及“怎么读”。
-                    spec = importlib.util.spec_from_file_location(f"{skill_name}_tools", tools_path)
-                    if spec and spec.loader:
-                        # 根据刚才那份spec，在内存中创建一个全新的、空的 Python 模块对象。
-                        module = importlib.util.module_from_spec(spec)
-                        # 真正读取 tools.py 里的代码，并在刚才创建的 module 命名空间里执行这些代码
-                        spec.loader.exec_module(module)
-
-                        # 扫描模块中所有被 @tool 装饰的 LangChain 工具
-                        for name, obj in inspect.getmembers(module):
-                            if isinstance(obj, BaseTool):
-                                skill_tools.append(obj)
-
-                # 3. 注册到内存
-                self.registry[skill_name] = {
-                    "description": skill_desc,
-                    "sop_prompt": sop_body,
-                    "tools": skill_tools
-                }
-
-                tool_names = [t.name for t in skill_tools]
-                logger.info(f"[SkillLoader] 注册Skill: {skill_name} | 挂载专属工具: {tool_names}")
+from .skill_loader import SkillLoader
 
 
 # ==========================================
 # 2. 状态与节点定义 (LangGraph)
 # ==========================================
-# 初始化依赖对象
+# 初始化依赖对象，作用于全局，只在该脚本被main导入的使用用一次，之后会被更新后的覆盖
 skill_manager = SkillLoader()
+
+# 超参数
 MAX_RETRY = 2
 
+
 class AgentState(TypedDict):
+    # 上下文
     messages: Annotated[list, add_messages]
     # Agent有权限触碰的文件夹
     workspace_dir: str
 
     # 如果除了文件之外还有结构化的输入，可以从这里传入
     # 这是一个兜底的设计。如果前端不仅传了文件，还传了 {"客户层级": "VIP", "开户时间": "2026-02-27"}
-    # TODO Agent应该具备在没获取所需的payload的时候调用工具主动向用户索要，在写工具的时候要有谱
     payload: Dict[str, Any]
     # 当前选择的SKILL
     selected_skill: str
@@ -101,14 +36,17 @@ class AgentState(TypedDict):
 def dynamic_tools_node(state: AgentState):
     """【执行器】：根据选定的 Skill，动态拉取专属工具并执行"""
     logger.info("[Tools] 正在绑定Skill专属工具...")
-
+    messages = state.get('messages')
     selected_skill = state.get("selected_skill")
     tool_error_counts = state['tool_error_counts'].copy()
     # 动态获取当前 Skill 的专属工具
     current_skill_tools = skill_manager.registry.get(selected_skill, {}).get("tools", [])
 
     # 构建 O(1) 的查找字典
+    # 这里得加上智能体的四个通用技能避免找不到
     tool_map = {t.name: t for t in current_skill_tools}
+    basic_tools_map = {"generate_skill":generate_skill,"ask_user":ask_user,"choose_skills":choose_skills,"check_workspace":check_workspace}
+    tool_map.update(basic_tools_map)
 
     last_msg = state["messages"][-1]
     tool_outputs = []
@@ -124,10 +62,24 @@ def dynamic_tools_node(state: AgentState):
             # 找到对应工具并执行
             tool_instance = tool_map[tool_name]
             try:
-                result = tool_instance.invoke(tool_args)
-                tool_outputs.append(
-                    ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_call["id"])
-                )
+                # IMPORTANT 除开几个basic_tool允许有注入参数，因为需要管理上下文和技能加载器之外，其他tool不应该有注入参数
+                if tool_name == 'choose_skills':
+                    # 直接覆盖就行，反正这个tool，LLM不会传参
+                    tool_args = {
+                        "latest_context": messages[-10:],
+                        "skill_manager": skill_manager
+                    }
+                    # 获取选择加载的skill名称，搭载skill
+                    selected_skill = tool_instance.invoke(tool_args)
+                    tool_outputs.append(
+                        ToolMessage(content=f'[技能选取] 成功选取技能 "{selected_skill}"', name=tool_name, tool_call_id=tool_call["id"])
+                    )
+
+                else:
+                    result = tool_instance.invoke(tool_args)
+                    tool_outputs.append(
+                        ToolMessage(content=str(result), name=tool_name, tool_call_id=tool_call["id"])
+                    )
                 logger.info(f'[Tools] 工具 {tool_name} 成功执行')
                 # 成功调用，重试计数清零
                 tool_error_counts[tool_name] = 0
@@ -164,22 +116,34 @@ def dynamic_tools_node(state: AgentState):
                 )
 
     # 增量更新状态
-    return {"tool_error_counts":tool_error_counts, "messages": tool_outputs}
+    return {"tool_error_counts":tool_error_counts, "messages": tool_outputs, "selected_skill": selected_skill}
 
 def llm_agent_node(state: AgentState):
     """【智能体大脑】：动态拼装标准上下文，执行工具调度"""
     logger.info("[Agent] 正在思考...")
+    system_prompt = """
+<role>
+你是一个专注而谨慎细心的智能体，负责解决用户提出的各类复杂任务。
+</role>
+
+<duty>
+你的使命是使用技能完成用户指派的各类任务，并严格遵循以下约束：
+1、对于不清楚的任务细节，总是主动询问用户确认，确保你的理解正确
+2、对于用户没有提供的任务所需参数和材料，总是主动询问用户索要
+3、完成任务前总是挑选技能，然后通过技能的标准流程完成任务
+4、你拥有很多tool帮助你完成任务，请积极地使用它们
+5、开始完成任务前总是与用户确认，获得用户认可之后再执行计划，计划执行中禁止再询问用户，因此总是在执行任务前确认好细节问题
+</duty>
+        """
+
     selected_skill = state.get("selected_skill")
-    # TODO没有搭载SKILL的时候挑选SKILL分支
-    #if not selected_skill:
 
-    # TODO有SKILL的时候切换SKILL分支
-    # TODO有SKILL的时候按着SKILL执行分支
-
-
+    # 按着SKILL执行
     # 1. 获取该 Skill 的 SOP
     sop_content = skill_manager.registry.get(selected_skill, {}).get("sop_prompt", "你是一个得力的助手。")
-
+    skill_tools_list = skill_manager.registry.get(selected_skill, {}).get('tools', [])
+    basic_tools_list = [generate_skill, ask_user, choose_skills, check_workspace]
+    all_tools_list = skill_tools_list + basic_tools_list
     # 2. 核心：将 workspace_dir 和 payload 作为系统级的环境变量，注入到 SOP 的末尾
     # 这样 Agent 既知道 SOP，又知道去哪里找文件，且完全不需要用户在提问中写明路径
     sop_context = (
@@ -189,18 +153,16 @@ def llm_agent_node(state: AgentState):
         f"- 当前工作目录 (Workspace): {state.get('workspace_dir', '未知')}\n"
         f"- 附加业务数据 (Payload): {state.get('payload', {})}"
     )
-    system_msg = HumanMessage(content=sop_context)
+    system_msg = SystemMessage(system_prompt)
+    sop_msg = HumanMessage(content=sop_context)
 
     # 3. 提取历史消息 (过滤掉可能混入的非标准 Message)，甚至可以排除之前的SKILL SOP的干扰，专注当下任务
     history = [m for m in state["messages"] if isinstance(m, (AIMessage, HumanMessage, ToolMessage))]
-
-    # 4. 强制组装：System 永远在绝对的第一位！
-    messages_for_llm = [system_msg] + history
+    messages_for_llm = [system_msg] + history + [sop_msg]
 
     # 5. 调用模型
-    # TODO这里似乎每次都要实例化，需要优化
-    agent_model = AgentModel(skill_manager.registry, selected_skill)
-    response = agent_model.work(messages_for_llm)
+    agent_with_tools = agent_model.bind_tools(all_tools_list)
+    response = agent_with_tools.invoke(messages_for_llm)
 
     # 6. 将模型的输出增量更新回全局状态
     return {"messages": [response]}
