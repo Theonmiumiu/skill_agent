@@ -12,8 +12,8 @@ router_model = ChatOpenAI(
     max_retries=2
 )
 
-agent_model = ChatOpenAI(
-    model = config.AGENT_MODEL,
+actor_model = ChatOpenAI(
+    model = config.ACTOR_MODEL,
     base_url = config.LLM_URL,
     api_key = config.LLM_API_KEY,
     temperature = 0.1,
@@ -21,4 +21,12 @@ agent_model = ChatOpenAI(
     max_retries=2
 )
 
+planner_model = ChatOpenAI(
+    model = config.PLANNER_MODEL,
+    base_url = config.LLM_URL,
+    api_key = config.LLM_API_KEY,
+    temperature = 0.1,
+    top_p=0.5,
+    max_retries=2
+)
 
