@@ -7,7 +7,6 @@ from typing import Annotated, Literal, TypedDict, Dict, Any
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import BaseTool
 from langgraph.graph import StateGraph, add_messages
-from .LLMs.router import RouterModel
 from .LLMs.agent import AgentModel
 from .utils.logger import logger
 from collections import defaultdict
@@ -75,15 +74,14 @@ class SkillLoader:
                 }
 
                 tool_names = [t.name for t in skill_tools]
-                logger.info(f"[SkillLoader] Skill: {skill_name} | 挂载专属工具: {tool_names}")
+                logger.info(f"[SkillLoader] 注册Skill: {skill_name} | 挂载专属工具: {tool_names}")
 
 
 # ==========================================
 # 2. 状态与节点定义 (LangGraph)
 # ==========================================
-# 初始化依赖对象（我记得import是把脚本从上到下全部扫一遍，所以我即使在main里不导入这俩依赖应该也没事吧）
+# 初始化依赖对象
 skill_manager = SkillLoader()
-router_model = RouterModel(skill_manager.registry)
 MAX_RETRY = 2
 
 class AgentState(TypedDict):
@@ -99,16 +97,6 @@ class AgentState(TypedDict):
     selected_skill: str
     # 工具节点重试记录
     tool_error_counts: defaultdict[str, int]
-
-def router_node(state: AgentState):
-    """开始节点，意图识别，仅更新 selected_skill，不污染 messages 列表"""
-    logger.info("[Router] 正在通过 Skill Description 识别意图...")
-    user_query = state["messages"][0].content
-    chosen_skill = router_model.route(user_query)
-    logger.info(f"[Router] 选中 Skill: [{chosen_skill}]")
-    # 更新AgentState
-    return {"selected_skill": chosen_skill}
-
 
 def dynamic_tools_node(state: AgentState):
     """【执行器】：根据选定的 Skill，动态拉取专属工具并执行"""
@@ -180,9 +168,14 @@ def dynamic_tools_node(state: AgentState):
 
 def llm_agent_node(state: AgentState):
     """【智能体大脑】：动态拼装标准上下文，执行工具调度"""
-    print("[Agent] 正在基于 SOP 思考...")
-
+    logger.info("[Agent] 正在思考...")
     selected_skill = state.get("selected_skill")
+    # TODO没有搭载SKILL的时候挑选SKILL分支
+    #if not selected_skill:
+
+    # TODO有SKILL的时候切换SKILL分支
+    # TODO有SKILL的时候按着SKILL执行分支
+
 
     # 1. 获取该 Skill 的 SOP
     sop_content = skill_manager.registry.get(selected_skill, {}).get("sop_prompt", "你是一个得力的助手。")
@@ -205,6 +198,7 @@ def llm_agent_node(state: AgentState):
     messages_for_llm = [system_msg] + history
 
     # 5. 调用模型
+    # TODO这里似乎每次都要实例化，需要优化
     agent_model = AgentModel(skill_manager.registry, selected_skill)
     response = agent_model.work(messages_for_llm)
 
@@ -223,17 +217,16 @@ def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
 def construct_app():
     # ==========================================
     # 3. 构建流转图 (ReAct State Machine)
+    # 似乎是个非常简单的图，甚至可能过于简单了
     # ==========================================
     # 构建流转图
     workflow = StateGraph(AgentState)
 
-    workflow.add_node("router", router_node)
     workflow.add_node("agent", llm_agent_node)
     # 直接挂载我们手写的动态节点，抛弃 prebuilt.ToolNode
     workflow.add_node("tools", dynamic_tools_node)
 
-    workflow.set_entry_point("router")
-    workflow.add_edge("router", "agent")
+    workflow.set_entry_point("agent")
     # 这个should_continue是个函数，会返回结束或者tools的字符串，也即节点名
     workflow.add_conditional_edges("agent", should_continue)
     workflow.add_edge("tools", "agent") # 工具执行完切回 Agent

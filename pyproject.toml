@@ -16,4 +16,5 @@ dependencies = [
     "opencv-python>=4.13.0.92",
     "pathlib>=1.0.1",
     "python-frontmatter>=1.1.0",
+    "seedir>=0.5.1",
 ]
