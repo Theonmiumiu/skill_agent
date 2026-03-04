@@ -10,6 +10,7 @@ from .utils.logger import logger
 # ==========================================
 # 1. Skill 解析器 (核心：动态加载物理文件与工具)
 # ==========================================
+#TODO最好SKILL的TOOL加载也能做成渐进式披露
 class SkillLoader:
     def __init__(self, base_dir: str = "skills"):
         self.base_dir = Path(base_dir)

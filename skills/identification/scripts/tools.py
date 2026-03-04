@@ -1,14 +1,168 @@
+# tools.py
 import cv2
 import numpy as np
 import json
+import time
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import tool
+from typing import Annotated
+from langchain_openai import ChatOpenAI
+import os
+from dotenv import load_dotenv
 from pathlib import Path
+import re
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
+from botocore.config import Config
+import json5
 
-# TODO需要review
+class Uploader:
+    """
+    负责链接云数据库并负责上传的实例
+    """
+    def __init__(self):
+        self.ak = os.getenv("TOS_AK")
+        self.sk = os.getenv("TOS_SK")
+        self.endpoint = os.getenv("OSS_ENDPOINT")
+        self.bucket_name = os.getenv("TOS_BUCKET_NAME")
+        self.allowed_extensions = {
+        # === 文档类 ===
+        '.pdf',                 # PDF
+        '.doc', '.docx',        # Word
+        '.txt', '.rtf',         # 纯文本/富文本
+
+        # === 图片类 ===
+        '.jpg', '.jpeg',        # JPEG
+        '.png',                 # PNG
+        '.gif',                 # GIF
+        '.bmp',                 # Bitmap
+        '.webp',                # WebP (现代网页常用)
+        '.tiff', '.tif',        # TIFF (印刷/扫描常用)
+        '.ico',                 # 图标
+
+        # === 音频类 ===
+        '.mp3',                 # MP3
+        '.wav',                 # WAV (无损)
+        '.aac', '.m4a',         # AAC/M4A (苹果设备常用)
+        '.flac',                # FLAC (发烧友无损)
+        '.ogg',                 # OGG
+        '.wma',                 # WMA
+        '.amr',                 # AMR (老式录音/语音)
+        '.opus',                # OPUS (高效语音编码，WhatsApp/Telegram常用)
+
+        # === 视频类 ===
+        '.mp4',                 # MP4 (最通用)
+        '.mov',                 # MOV (QuickTime)
+        '.avi',                 # AVI
+        '.mkv',                 # MKV (虽然兼容性一般，但很多高清资源是这个)
+        '.webm',                # WebM (网页视频)
+        '.flv',                 # FLV (老式Flash视频)
+        '.wmv',                 # WMV
+        '.mpeg', '.mpg',        # MPEG
+        '.m4v',                 # M4V
+        '.3gp',                 # 3GP (老手机视频)
+        '.ts',                  # TS流
+    }
+
+        tos_config = Config(
+            region_name='cn-shanghai',
+            s3={'addressing_style': 'virtual'}
+        )
+
+        self.s3_client = boto3.client(
+            's3',
+            aws_access_key_id=self.ak,
+            aws_secret_access_key=self.sk,
+            endpoint_url=self.endpoint,
+            config=tos_config
+        )
+
+    def _check_file_exists(self, object_name: str)->bool:
+        """
+        检查文件在云端是否存在
+        :param object_name: 在云端上的文件名
+        :return: 返回是否存在的判断
+        """
+        try:
+            # head_object 只获取文件元数据，不下载内容，速度极快且不怎么耗流量
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=object_name)
+            return True
+        except ClientError:
+            # 如果报 404 Not Found，说明文件不存在
+            return False
+
+    def upload_and_get_presigned_url(self, file_path: Path, file_type: str, expiration=3600):
+        """
+        将本地文件上传到云端，获取url便于传给模型
+        :param file_path: 文件在本地的路径
+        :param file_type: 文件的类型，暂时可以接受text,image,video,audio,file，作用只是把不同的文件归到不同的文件夹下
+        :param expiration: 云端链接有效期
+        :return: 云端容器上文件的url
+        """
+
+        def _sanitize_filename(name):
+            """
+            辅助函数，用于得到安全文件名
+            """
+            # 1. 替换非法字符为下划线
+            # \ / : * ? " < > | 以及 控制字符
+            name = re.sub(r'[\/\\:\*\?"<>| \x00-\x1f]', '_', name)
+
+            # 2. 去除首尾的空格和句点
+            name = name.strip(". ")
+
+            # 3. 检查 Windows 保留字
+            reserved_names = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3",
+                              "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                              "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+                              "LPT7", "LPT8", "LPT9"}
+            if name.upper() in reserved_names:
+                name = f"_{name}"
+
+            # 4. 截断长度（防止过长）
+            return name[:250]
+
+
+        try:
+            ext = file_path.suffix
+            if ext not in self.allowed_extensions:
+                print(f'上传的文件的文件类型不受支持：{ext}')
+                return None
+            stem = _sanitize_filename(file_path.stem)
+            if file_type in {'text','image','video','audio','file'}:
+                object_name = f"{file_type}/{stem}{ext}"
+            else:
+                print(f'传入的文件类型不受支持：{file_type}')
+                return None
+
+            #【缓存命中检查】检查云端是否已经有这个文件
+            if self._check_file_exists(object_name):
+                print(f"⚡ [缓存命中] 文件已存在，跳过上传: {object_name}")
+            else:
+                # 缓存未命中，执行上传
+                print(f"⬆️ [新文件] 正在上传: {object_name}")
+                self.s3_client.upload_file(str(file_path), self.bucket_name, object_name)
+
+            # 无论是否新上传，都生成预签名 URL (生成 URL 是本地计算，无需网络请求)
+            url = self.s3_client.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': self.bucket_name, 'Key': object_name},
+                ExpiresIn=expiration
+            )
+            return url
+
+        except NoCredentialsError:
+            print("❌ 凭证错误，请检查 .env 配置")
+            return None
+        except Exception as e:
+            print(f"❌ 处理失败: {e}")
+            return None
+
 
 def _mask_id_card(image: np.ndarray) -> np.ndarray:
     """
     精细版辅助函数：利用几何特征和宽高比，动态识别并遮挡身份证区域。
+    （已新增：自动将中间结果保存到本地 debug_masks_output 文件夹）
     """
     h, w = image.shape[:2]
     # 初始化全白（255）的掩膜
@@ -26,7 +180,6 @@ def _mask_id_card(image: np.ndarray) -> np.ndarray:
     edges = cv2.Canny(blur, 50, 150)
 
     # 3. 闭运算 (Morphology Close)：连接断裂的边缘线条
-    # 身份证反光可能导致边缘断裂，这一步能将其重新连成一个完整的框
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
@@ -62,123 +215,221 @@ def _mask_id_card(image: np.ndarray) -> np.ndarray:
         # 找到了身份证！将其涂黑 (0)
         cv2.drawContours(mask, [id_contour], -1, 0, -1)
 
-        # 安全操作：稍微向外膨胀一点黑色区域（腐蚀白色掩膜），
-        # 确保身份证的边缘（甚至是手指捏着的地方）也被完全遮挡，避免边缘干扰特征点提取
+        # 安全操作：稍微向外膨胀一点黑色区域（腐蚀白色掩膜）
         kernel_erode = np.ones((20, 20), np.uint8)
         mask = cv2.erode(mask, kernel_erode, iterations=1)
     else:
-        # 【降级方案 (Fallback)】：如果背景过于杂乱或对比度太低导致找不到轮廓
-        # 退回到保守的中央区域遮挡，防止程序崩溃
+        # 【降级方案 (Fallback)】
         x1, y1 = int(w * 0.25), int(h * 0.25)
         x2, y2 = int(w * 0.75), int(h * 0.75)
         cv2.rectangle(mask, (x1, y1), (x2, y2), 0, -1)
 
+    # ==========================================
+    # 新增：自动保存验证图片到本地
+    # ==========================================
+    try:
+        # 在运行代码的同级目录下创建一个 debug 文件夹
+        debug_dir = "debug_masks_output"
+        os.makedirs(debug_dir, exist_ok=True)
+
+        # 获取当前时间戳，防止多次运行覆盖前面的图片
+        timestamp = int(time.time() * 1000)
+
+        # 为了直观展示，如果原图是单通道灰度图，先临时转回三通道
+        if len(image.shape) == 2:
+            vis_image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        else:
+            vis_image = image.copy()
+
+        # 核心：将 mask 盖回原图。这里会把原图里的身份证位置变成纯黑，木桌背景保留原样
+        visualized_result = cv2.bitwise_and(vis_image, vis_image, mask=mask)
+
+        # 1. 保存纯黑白的算法底层 Mask (0和255)
+        cv2.imwrite(os.path.join(debug_dir, f"1_mask_logic_{timestamp}.jpg"), mask)
+        # 2. 保存你最关心的“涂黑后的原图”
+        cv2.imwrite(os.path.join(debug_dir, f"2_mask_applied_{timestamp}.jpg"), visualized_result)
+
+        # 静默执行，不打印过多日志干扰控制台
+    except Exception as e:
+        print(f"  [Debug] 图片保存失败: {str(e)}")
+    # ==========================================
+
     return mask
 
 
-@tool
-def verify_background_consistency(workspace_dir: str) -> str:
+def cv_method(
+        image_path_1: Annotated[str, "第一张需要分析的照片的文件路径"],
+        image_path_2: Annotated[str, "第二张需要分析的照片的文件路径"]
+) -> str:
     """
-    验证工作区内的两张证件照片背景是否属于同一个真实物理位置。
-    输入：包含待验证照片的文件夹绝对或相对路径 (workspace_dir)。
-    输出：包含 is_same_place, inliers_count, homography_valid, confidence_score 的 JSON 字符串。
+    使用统计学视觉特征评估两张身份证照片的背景一致性。这个工具经过优化，足够全面和稳健
+    输出通过cv算法得出的"颜色相关性"、"纹理相关性"、"亮度相似性"，越接近1表明越相关或者相似，
     """
-    try:
-        # ==========================================
-        # 1. 自动接管工作区：彻底消除大模型的路径幻觉
-        # ==========================================
-        work_path = Path(workspace_dir)
-        if not work_path.exists() or not work_path.is_dir():
-            return json.dumps({"error": f"工作区路径无效或不存在: {workspace_dir}"})
+    # 1. 加载图像并校验
+    img1 = cv2.imread(image_path_1)
+    img2 = cv2.imread(image_path_2)
 
-        # 智能扫描常见图片格式，忽略大小写
-        valid_extensions = {".jpg", ".jpeg", ".png"}
-        image_files = [
-            p for p in work_path.iterdir()
-            if p.is_file() and p.suffix.lower() in valid_extensions
-        ]
+    if img1 is None or img2 is None:
+        return {"error": "无法读取图片，请检查路径。"}
 
-        if len(image_files) < 2:
-            return json.dumps({
-                "error": f"工作区内图片不足2张，当前找到 {len(image_files)} 张，无法进行比对。请检查输入源。"
-            })
+    # 2. 提取并合并背景掩膜
+    # 生成各自的掩膜 (背景=255, 证件=0)
+    mask1 = _mask_id_card(img1)
+    mask2 = _mask_id_card(img2)
 
-        # 稳定抓取前两张图片（系统通常会为单次任务准备干净的独立文件夹）
-        image_path_1 = str(image_files[0])
-        image_path_2 = str(image_files[1])
+    # 关键步骤：取两个掩膜的交集 (bitwise_and)
+    # 这样确保我们只比较两张照片中 *共同暴露* 的背景区域，不受证件位置变化的影响
+    common_mask = cv2.bitwise_and(mask1, mask2)
 
-        print(f"  [视觉引擎] 成功从工作区抓取目标: {image_files[0].name} & {image_files[1].name}")
+    # 如果公共背景区域太小（比如两张身份证刚好占据了完全不同的屏幕角落），直接返回低分
+    if cv2.countNonZero(common_mask) < (img1.shape[0] * img1.shape[1] * 0.1):
+         return {"error": "公共背景区域过小，无法有效提取特征。"}
 
-        # ==========================================
-        # 2. 核心视觉算法执行 (完全复用你的硬核逻辑)
-        # ==========================================
-        # 以灰度模式读取图片
-        img1 = cv2.imread(image_path_1, cv2.IMREAD_GRAYSCALE)
-        img2 = cv2.imread(image_path_2, cv2.IMREAD_GRAYSCALE)
+    # ==========================================
+    # 维度一：全局颜色分布相似度 (HSV Color Histogram)
+    # ==========================================
+    hsv1 = cv2.cvtColor(img1, cv2.COLOR_BGR2HSV)
+    hsv2 = cv2.cvtColor(img2, cv2.COLOR_BGR2HSV)
 
-        if img1 is None or img2 is None:
-            return json.dumps({"error": "图片 OpenCV 读取失败，可能是文件损坏。"})
+    # 提取 Hue(色相) 和 Saturation(饱和度) 通道的 2D 直方图
+    hist_color1 = cv2.calcHist([hsv1], [0, 1], common_mask, [50, 60], [0, 180, 0, 256])
+    hist_color2 = cv2.calcHist([hsv2], [0, 1], common_mask, [50, 60], [0, 180, 0, 256])
 
-        # 生成遮罩，过滤掉证件主体
-        mask1 = _mask_id_card(img1)
-        mask2 = _mask_id_card(img2)
+    cv2.normalize(hist_color1, hist_color1, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    cv2.normalize(hist_color2, hist_color2, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
 
-        # 提取 SIFT 特征点和描述子
-        sift = cv2.SIFT_create()
-        kp1, des1 = sift.detectAndCompute(img1, mask1)
-        kp2, des2 = sift.detectAndCompute(img2, mask2)
+    # 使用相关性(Correlation)比较，范围 [-1, 1]
+    color_score = cv2.compareHist(hist_color1, hist_color2, cv2.HISTCMP_CORREL)
 
-        # 如果背景过于干净（如纯白纸），直接短路返回
-        if des1 is None or des2 is None or len(kp1) < 5 or len(kp2) < 5:
-            return json.dumps({
-                "is_same_place": False,
-                "inliers_count": 0,
-                "homography_valid": False,
-                "confidence_score": 0.0
-            })
+    # ==========================================
+    # 维度二：全局纹理结构相似度 (Sobel Gradient Histogram)
+    # ==========================================
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
 
-        # 使用 FLANN 进行特征点匹配
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-        search_params = dict(checks=50)
-        flann = cv2.FlannBasedMatcher(index_params, search_params)
-        matches = flann.knnMatch(des1, des2, k=2)
+    # 使用 Sobel 算子计算图像的局部梯度（捕捉木纹、缝隙等纹理特征）
+    grad_x1, grad_y1 = cv2.Sobel(gray1, cv2.CV_32F, 1, 0), cv2.Sobel(gray1, cv2.CV_32F, 0, 1)
+    grad_x2, grad_y2 = cv2.Sobel(gray2, cv2.CV_32F, 1, 0), cv2.Sobel(gray2, cv2.CV_32F, 0, 1)
 
-        # 使用 Lowe's ratio test 筛选高质量的匹配点
-        good_matches = []
-        for m, n in matches:
-            if m.distance < 0.7 * n.distance:
-                good_matches.append(m)
+    mag1 = cv2.magnitude(grad_x1, grad_y1)
+    mag2 = cv2.magnitude(grad_x2, grad_y2)
 
-        inliers_count = 0
-        homography_valid = False
-        confidence_score = 0.0
+    # 映射回 0-255 并计算直方图
+    mag1_8u = np.uint8(np.clip(mag1, 0, 255))
+    mag2_8u = np.uint8(np.clip(mag2, 0, 255))
 
-        # 空间透视一致性校验 (Homography + RANSAC)
-        if len(good_matches) >= 10:
-            src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-            dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    hist_tex1 = cv2.calcHist([mag1_8u], [0], common_mask, [64], [0, 256])
+    hist_tex2 = cv2.calcHist([mag2_8u], [0], common_mask, [64], [0, 256])
 
-            M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    cv2.normalize(hist_tex1, hist_tex1, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    cv2.normalize(hist_tex2, hist_tex2, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
 
-            if M is not None:
-                homography_valid = True
-                inliers_count = int(np.sum(mask))
-                confidence_score = round(inliers_count / max(len(good_matches), 1), 2)
-        else:
-            inliers_count = len(good_matches)
+    texture_score = cv2.compareHist(hist_tex1, hist_tex2, cv2.HISTCMP_CORREL)
 
-        # 综合判定
-        is_same_place = bool(homography_valid and inliers_count >= 15 and confidence_score >= 0.85)
+    # ==========================================
+    # 维度三：环境光照一致性 (Mean Brightness Check)
+    # ==========================================
+    mean_val1 = cv2.mean(gray1, mask=common_mask)[0]
+    mean_val2 = cv2.mean(gray2, mask=common_mask)[0]
 
-        # 组装结果并返回
-        result = {
-            "is_same_place": is_same_place,
-            "inliers_count": inliers_count,
-            "homography_valid": homography_valid,
-            "confidence_score": confidence_score
-        }
-        return json.dumps(result)
+    # 将绝对差异转化为 0 到 1 的得分（假设最大差异阈值为 255）
+    brightness_diff = abs(mean_val1 - mean_val2)
+    brightness_score = max(0.0, 1.0 - (brightness_diff / 255.0))
 
-    except Exception as e:
-        return json.dumps({"error": f"图像处理过程中发生异常: {str(e)}"})
+    # ==========================================
+    # 综合判定
+    # ==========================================
+    # 将负相关修正为 0
+    color_score = max(0.0, float(color_score))
+    texture_score = max(0.0, float(texture_score))
+
+    result = {
+        "color_correlation": round(color_score, 3),
+        "texture_correlation": round(texture_score, 3),
+        "brightness_score": round(brightness_score, 3)
+    }
+
+    return json.dumps(result)
+
+# 获取环境变量
+current_dir = Path(__file__).parent
+env_path = current_dir / ".env"
+
+load_dotenv(env_path, override=True)
+model = os.getenv("MODEL")
+llm_url = os.getenv("LLM_URL")
+llm_api_key = os.getenv("LLM_API_KEY")
+# 相似度接收阈值超参数
+THRESHOLD = 0.75
+
+# 初始化上传器实例
+uploader = Uploader()
+
+visual_llm = ChatOpenAI(
+    model = model,
+    base_url = llm_url,
+    api_key = llm_api_key,
+    temperature = 0.1,
+    top_p=0.5,
+    max_retries=2,
+    extra_body={
+        "enable_thinking" : False
+    }
+)
+
+@tool()
+def verify_background_consistency(
+        image_path_1: Annotated[str, "第一张需要分析的照片的文件路径"],
+        image_path_2: Annotated[str, "第二张需要分析的照片的文件路径"]
+) -> dict:
+    """
+    用于审核两张图片是否是在相同的背景下拍摄，综合了VLM和传统计算机视觉方法
+    输出一个结果字典，包含"判断依据"和"审查结果"两个字段
+    """
+    image_url_1 = uploader.upload_and_get_presigned_url(Path(image_path_1),"image")
+    image_url_2 = uploader.upload_and_get_presigned_url(Path(image_path_2),"image")
+    print(f'图片上传云端结束')
+    cv_report = cv_method(image_path_1, image_path_2)
+    print(f'图片传统计算机视觉对比结束：\n{cv_report}')
+    system_prompt = """
+<role>
+你是一位注册资料审查员，专门负责证件审查。
+</role>
+
+<task>
+你将会收到两张身份证图片和一份对这两张图片的审查报告.
+请参考审查报告并结合你看到的图片，判断这两张图片是否在同一个背景下拍摄，只有拍摄于同一个背景才能通过
+背景可以有旋转，位移，透视缩放，但是必须是同一个物体，比如同一本书，同一张桌子等
+完成任务后请按照<output_format>中的格式要求输出，"审查结果"字段只能从["通过","不通过"]选择一个输出
+除了要求输出的字典外不要有任何多余的语言
+</task>
+
+<output_format>
+{
+"判断依据":"XXXXXXX...",
+"审查结果":"通过"
+}
+</output_format>
+
+"""
+
+    message_list = [
+        SystemMessage(system_prompt),
+        HumanMessage(
+                [
+            {
+                'type': 'image_url',
+                'image_url': {'url': image_url_1, 'detail': "high"}
+            },
+            {
+                'type': 'image_url',
+                'image_url': {'url': image_url_2, 'detail': "high"}
+            }
+            ]
+        ),
+        HumanMessage(cv_report)
+    ]
+    res = visual_llm.invoke(message_list)
+    # 这里没做输出格式核验
+    print(f'llm整合结束')
+    return json5.loads(res.content)

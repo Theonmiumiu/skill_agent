@@ -4,12 +4,13 @@ from typing import Annotated, Literal, TypedDict, Dict, Any, List
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langgraph.graph import StateGraph, add_messages
 from .LLMs.basic_tools import generate_skill, ask_user, choose_skills, check_workspace
-from .LLMs.base_models import actor_model, planner_model
+from .LLMs.base_models import actor_model, planner_model, reporter_model, stream_wrapper
 from .utils.logger import logger
 from collections import defaultdict
 from .skill_loader import SkillLoader
 from .LLMs.skill_choose_model import SkillChooseModel
-from pydantic import BaseModel, Field
+import json5
+import re
 
 # ==========================================
 # 2. 状态与节点定义 (LangGraph)
@@ -34,19 +35,15 @@ class AgentState(TypedDict):
     # 当前选择的SKILL
     selected_skill: str
     # 工具节点重试记录
-    tool_error_counts: defaultdict[str, int]
+    error_counts: defaultdict[str, int]
 
     # 引入草稿纸架构
     # 当前剩下的任务清单
     plan: List[str]
     # 历史已完成的步骤总结，使用 operator.add 意味着每次 return 都会 append 追加
+    # 里面包含了每个actor调用的结果原文
     past_steps: Annotated[List[str], operator.add]
 
-class PlanUpdate(BaseModel):
-    """用于动态更新任务执行计划的结构"""
-    steps: List[str] = Field(
-        description="基于当前状态，按照先后顺序排列的【剩余未完成步骤】列表。如果所有终极目标已全部达成，请返回空列表 []。"
-    )
 
 def skill_router_node(state: AgentState):
     """拦截 Agent 的技能切换请求，调用小模型分配技能"""
@@ -59,9 +56,10 @@ def skill_router_node(state: AgentState):
     for tc in last_msg.tool_calls:
         if tc["name"] == "choose_skills":
             # 挑选技能的逻辑保持不变
-            demand = AIMessage(tc.args['demand'])
-            recent_context = state["messages"][-10:]
-            context = recent_context + [demand]
+            demand = HumanMessage(tc['args']['demand'])
+            # 获取最近的有效上下文
+            # 这个提示词没问题，只需要actor说一说将要处理的问题的描述，就能匹配上了
+            context = [demand.content]
             new_skill = skill_choose_model.choose(context)
             if not new_skill:
                 new_skill = ""
@@ -81,15 +79,15 @@ def skill_router_node(state: AgentState):
     return {
         "selected_skill": new_skill,
         "messages": messages_to_return,
-        "plan": []
+        "plan": [],
+        "past_steps": [f"【系统动作】智能体因遇到能力瓶颈，主动申请并成功切换了专属技能至: {new_skill}"]
     }
 
 def dynamic_tools_node(state: AgentState):
     """【执行器】：根据选定的 Skill，动态拉取专属工具并执行"""
     logger.info("[Tools] 正在绑定Skill专属工具...")
-    messages = state.get('messages')
     selected_skill = state.get("selected_skill")
-    tool_error_counts = state['tool_error_counts'].copy()
+    tool_error_counts = state['error_counts'].copy()
     # 动态获取当前 Skill 的专属工具
     current_skill_tools = skill_manager.registry.get(selected_skill, {}).get("tools", [])
 
@@ -125,7 +123,7 @@ def dynamic_tools_node(state: AgentState):
                 if retry < MAX_RETRY:
                     logger.warning(f'[Tools] 工具 {tool_name} 执行异常，执行第 {retry+1} 次重试')
                     tool_outputs.append(
-                        ToolMessage(content=f"工具执行异常: {str(e)}，请检查问题后尝试重新调用", name=tool_name, tool_call_id=tool_call["id"])
+                        ToolMessage(content=f"工具执行异常: {str(e)}，请检查问题后尝试重新调用，不需要向上级或用户汇报此次错误", name=tool_name, tool_call_id=tool_call["id"])
                     )
                     tool_error_counts[tool_name] +=1
                 else:
@@ -157,7 +155,7 @@ def dynamic_tools_node(state: AgentState):
 
 
 def planner_node(state: AgentState):
-    """【草稿纸规划节点】：负责宏观任务拆解与清单更新"""
+    """负责宏观任务拆解与清单更新"""
     logger.info("[Planner] 正在审视全局，更新任务草稿纸...")
 
     # 获取用户的最最开始的任务
@@ -171,7 +169,7 @@ def planner_node(state: AgentState):
     past_steps = state.get("past_steps", [])
 
     # 取出最近的一条 agent 执行结果（如果是 agent 正常回复，说明上一步干完了）
-    last_message = state["messages"][-1]
+    error_counts = state["error_counts"].copy()
 
     # 获取当前skill下的所有tools
     skill_tools_list = skill_manager.registry.get(selected_skill, {}).get('tools', [])
@@ -183,22 +181,34 @@ def planner_node(state: AgentState):
     # 动态构建系统提示词，强制要求模型关注大局
     system_prompt = f"""
 <role>
-你是一个高级任务规划主管，负责规划拆接任务步骤，不进行具体执行。
+你是一个高效而果断任务规划主管，负责快速的规划拆接任务步骤，不进行具体执行。同时，你有一个下级执行你的任务列表中的任务。你们相互协作，因此不要亲自执行任务，只列出任务列表
 </role>
 
 <duty>
-你的使命是基于用户的原始需求以及最新的对话进展，输出一份最新的、剩余的计划步骤清单。并严格遵循以下约束：
-1、总是尝试根据技能中的说明来完成任务
-2、在从零生成初始计划时，对于不清楚的任务细节，总是主动询问用户确认，确保你的理解正确
-3、对于用户没有提供的任务所需参数和材料，总是主动询问用户索要
-4、确保你的计划中的任务粒度适中，并且足够明确，并可以被工具调用或者简单思考解决
-5、如果认为任务已全部彻底完成，已经做好了回答用户原始需求的准备，则输出空列表
+你的使命是基于用户的原始需求<original_user_request>，之前的计划<former_plan>以及已经完成的步骤<executed_task>，输出一份最新的、包含剩余的完成任务所需步骤计划的清单。并遵循以下约束：
+1、参考技能<skill>中的说明编排任务，并输出编排好的任务列表，以便下级完成
+2、你的输出应该是一个列表，列表中元素为任务的字符串，不要有任何除了这个列表之外的回答
+3、如果你观察到<executed_task>已经完成了<skill>中的**除开按格式输出之外**的所有步骤，则固定输出["格式化输出"]
 </duty>
 
 <original_user_request>
-【重要】：这是用户最初始的核心诉求，你所有的计划拆解都必须为了服务于这个终极目标！
+这是用户最初始的核心诉求，你所有的计划拆解都必须为了服务于这个终极目标！
 {original_request}
 </original_user_request>
+
+<workspace_dir>
+当前工作目录 (Workspace): {state.get('workspace_dir', '未知')}
+</workspace_dir>
+
+<skill>
+{sop_content}
+请无视<skill>中的格式要求，你作为任务规划主管，总是输出列表！
+</skill>
+
+<tools>
+这个tools不是给你用的，但你可以安排你的下级使用它们
+{tools_catalog}
+</tools>
 
 <former_plan>
 {plan if plan else '目前尚无计划，需要你从零生成。'}
@@ -208,43 +218,34 @@ def planner_node(state: AgentState):
 {past_steps if past_steps else '目前刚开始，尚无已完成的步骤。'}
 </executed_task>
 
-<skill>
-{sop_content}
-</skill>
-
-<tools>
-{tools_catalog}
-</tools>
-
-<example>
-用户需求：帮我看看 workspace 里的销售数据，算一下总利润。
-正确拆分：
+<example_output>
 [
   "调用 check_workspace 工具了解目录结构，寻找包含销售数据的文件",
   "调用 python_repl 工具读取数据文件，并计算总利润字段",
   "将计算得到的最终总利润数值汇报给用户"
 ]
-</example>
+</example_output>
 """
 
     # 组装消息，调用带有强制 JSON 输出约束的小模型
-    messages = [SystemMessage(content=system_prompt)] + state["messages"][-8:]  # 只给最近的对话防止污染
+    notice = f'再次提醒你的任务是返回任务列表，而不是亲自执行任务！在下级已经完成**除开按格式输出之外**的所有步骤时，固定输出["格式化输出"]。\n你需要快速给出结果！快速给出结果！快速给出结果！得到可行结果后直接输出！严禁推敲和来回反思'
+    messages = [SystemMessage(content=system_prompt), SystemMessage(content=notice)]  # 只给最近的对话防止污染
 
-    # with_structured_output 极其强大，它会自动把大模型的输出转成你定义的 Pydantic 对象
-    planner_llm = planner_model.with_structured_output(PlanUpdate)
-    response = planner_llm.invoke(messages)
-
-    new_plan = response.steps
-    logger.info(f"[Planner] 最新的任务清单已更新为: {new_plan}")
-
-    # 如果 agent 刚刚汇报了工作成果，我们将它的回答总结进 past_steps 中
-    updates = {"plan": new_plan}
-    if isinstance(last_message, AIMessage) and not last_message.tool_calls and plan:
-        # 记录刚刚完成的任务及其结果
-        finished_step_summary = f"执行了任务 '{plan[0]}'。结果汇报: {last_message.content}"
-        updates["past_steps"] = [finished_step_summary]
-
-    return updates
+    response = stream_wrapper(planner_model, messages)
+    match = re.search(r'\[.*?\]', response.content, re.DOTALL)
+    if match:
+        json_str = match.group(0)
+        new_plan = json5.loads(json_str)
+        logger.info(f"[Planner] 最新的任务清单已更新为: {new_plan}")
+        error_counts["planner"] = 0
+        return {"plan": new_plan, "error_counts": error_counts}
+    elif error_counts['planner']<MAX_RETRY:
+        logger.warning(f'[Planner] Planner节点似乎出现返回格式问题，尝试重新调用')
+        error_counts["planner"] += 1
+        return {"error_counts": error_counts}
+    else:
+        logger.warning(f'[Planner] Planner节点反复调用仍然失败，请检查模型原因')
+        return {"plan":[], "past_steps":["planner模型内部失败，原因可能源于模型供应商，智能体系统崩溃"]}
 
 
 def actor_node(state: AgentState):
@@ -280,20 +281,18 @@ def actor_node(state: AgentState):
 
     # 倒序回来，恢复正常的时间线
     active_loop_messages.reverse()
-    # 将用户的原始需求加在最前面兜底，保证 Actor 不跑偏
-    if original_user_msg and original_user_msg not in active_loop_messages:
-        active_loop_messages.insert(0, original_user_msg)
+    # 不能知道用户的原始需求，否则要自作聪明
 
     system_prompt = f"""
 <role>
-你是一个专注而谨慎细心的执行者，负责使用手头的工具来解决任务。
+你是一个专注而谨慎细心的执行者，负责使用手头的工具来解决任务，然后向你的上级汇报工作
 </role>
 
 <duty>
 你的使命是使用技能完成任务，并严格遵循以下约束：
-1、你拥有很多tool帮助你完成任务，请积极地使用它们
-2. 当且仅当你确认该任务已经完全达成，或者彻底失败无法推进时，你**必须**输出一段总结性的文本（例如：“我收到的任务是什么，我已经完成了...操作，结果是...”）。
-3. 这段总结性文本将作为向上级汇报的凭证，严禁在任务未结束前输出纯闲聊文本！
+1、你拥有很多tool帮助你完成任务，请积极地使用它们，如果工具调用失败，可以依照工具的反馈进行重试或者放弃。你的回答里总应该包含工具输出的原文
+2、当且仅当你确认该任务已经完全达成，或者彻底失败无法推进时，你**必须**输出一段总结性的文本（包含例如：“我收到的任务是什么“，”我已经完成了...操作，结果是...”，"工具调用的结果是..."）。
+3、这段总结性文本将作为向上级汇报的内容，严禁输出任何与当前任务无关的事情，不要发问或者闲聊
 </duty>
 
 <task>
@@ -327,29 +326,89 @@ def actor_node(state: AgentState):
 
     # 5. 调用模型
     agent_with_tools = actor_model.bind_tools(all_tools_list)
-    response = agent_with_tools.invoke(messages_for_llm)
+    #response = agent_with_tools.invoke(messages_for_llm)
+    response = stream_wrapper(agent_with_tools, messages_for_llm)
 
-    # 6. 将模型的输出增量更新回全局状态
-    return {"messages": [response]}
+    # 【核心修复】：让干活的人自己去写总结汇报！
+    updates = {"messages": [response]}
 
+    # 如果 response 里没有 tool_calls，说明它不是在调工具，而是真的完成了这个子任务在输出总结！
+    if not getattr(response, "tool_calls", None):
+        finished_step_summary = f"当前任务是 '{current_task}'。执行结果汇报: {response.content}"
+        updates["past_steps"] = [finished_step_summary]
 
-def route_from_agent(state: AgentState) -> Literal["tools", "router", "planner"]:
+    return updates
+
+def reporter_node(state: AgentState):
+    """【最终答复节点】：负责汇总所有成果，向用户做最终的优雅交付"""
+    logger.info("[Reporter] 任务全部结束，正在撰写最终交付报告...")
+
+    # 获取skill
+    selected_skill = state.get("selected_skill", "")
+    sop_content = skill_manager.registry.get(selected_skill, {}).get("sop_prompt", "无技能")
+
+    # 1. 拿回用户的原始需求
+    # TODO第一个输入可能没有不是当前需求，之后的改进方向
+    original_request = state["messages"][0].content if state["messages"] else "未知需求"
+
+    # 2. 拿出所有打工人踩过的坑和拿到的数据
+    past_steps = state.get("past_steps", [])
+    past_steps_text = "\n".join(past_steps) if past_steps else "未执行任何具体步骤。"
+
+    system_prompt = f"""
+    <role>
+    你是一个冷酷、专业严谨的交付专员。你的后台团队已经为你收集了所有的必要信息。
+    </role>
+
+    <duty>
+    你的唯一任务是：基于后台团队的【执行记录】，严格按照技能<skill>块中的输出格式要求输出结果
+    如果后台团队的执行记录显示任务最终失败（例如没找到文件、权限不足），请仍然按照格式输出，但是内容解释为何任务失败
+    </duty>
+
+    <original_user_request>
+    {original_request}
+    </original_user_request>
+
+    <backend_execution_records>
+    {past_steps_text}
+    </backend_execution_records>
+    
+    <skill>
+    {sop_content}
+    </skill>
+    """
+    # 只需要系统提示词就够了，直接生成最终回答
+    # 我们调用那个带流式输出的 actor_model，并且同样可以使用 stream_wrapper 让它有思考过程
+
+    messages_for_llm = [SystemMessage(content=system_prompt)]
+
+    logger.info("[Reporter] 正在生成最终回答...")
+    response_msg = stream_wrapper(reporter_model, messages_for_llm)
+
+    # 追加到全局 messages 列表中，作为整个 Agent 运行的完美收尾
+    return {"messages": [response_msg]}
+
+def route_from_actor(state: AgentState) -> Literal["tools", "router", "planner"]:
     last_message = state["messages"][-1]
 
     if getattr(last_message, "tool_calls", None):
         for tc in last_message.tool_calls:
             if tc["name"] == "choose_skills":
                 return "router"
+
         return "tools"
 
     # 如果没调用工具，说明它干完了一步，输出了一段话，回去重新盘算草稿纸！
     return "planner"
 
 
-def route_from_planner(state: AgentState) -> Literal["actor", "__end__"]:
+def route_from_planner(state: AgentState) -> Literal["actor", "reporter", "planner"]:
+    if state.get('error_counts')['planner'] != 0:
+        return "planner"
     # 计划空了，说明大功告成，打完收工
-    if not state.get("plan", []):
-        return "__end__"
+    elif not state.get("plan", []) or state['plan'] == ['格式化输出']:
+        return "reporter"
+
     # 还有计划，继续做
     return "actor"
 
@@ -363,16 +422,18 @@ def construct_app():
     workflow.add_node("router", skill_router_node)
     workflow.add_node("actor", actor_node)
     workflow.add_node("tools", dynamic_tools_node)
+    workflow.add_node("reporter", reporter_node)
 
     # 图的入口现在变成了 planner！上来先做计划！
     workflow.set_entry_point("planner")
 
     # 复杂的交通枢纽配置
     workflow.add_conditional_edges("planner", route_from_planner)
-    workflow.add_conditional_edges("actor", route_from_agent)
+    workflow.add_conditional_edges("actor", route_from_actor)
 
     workflow.add_edge("tools", "actor")
     workflow.add_edge("router", "planner")  # 切完技能，强制回炉重造计划！
+    workflow.add_edge("reporter", "__end__")
 
     return workflow.compile()
 

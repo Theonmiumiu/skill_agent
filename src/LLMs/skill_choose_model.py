@@ -1,7 +1,8 @@
-from .base_models import router_model
+from .base_models import router_model, stream_wrapper
 from pydantic import BaseModel, field_validator, ValidationError
 from ..utils.logger import logger
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
 
 template_prompt_system = """
     <role>
@@ -77,7 +78,8 @@ class SkillChooseModel:
             raw_output = ''
             try:
                 # 1. 调用云托管 LLM (网络波动与超时重试已交由 ChatOpenAI 底层接管)
-                llm_res = router_model.invoke(prompt)
+                #llm_res = router_model.invoke(prompt)
+                llm_res = stream_wrapper(router_model, prompt)
                 # 安全提取字符串，并剔除大模型可能手贱加的前后空格或换行
                 raw_output = llm_res.content.strip()
                 # 3. 使用动态生成的 Pydantic 类进行严格校验

@@ -2,7 +2,7 @@
 from langchain_core.tools import tool
 from typing import Annotated
 import seedir as sd
-from ..utils.logger import logger
+#from ..utils.logger import logger
 
 @tool()
 def check_workspace(
@@ -10,7 +10,7 @@ def check_workspace(
 ) -> str:
     """
     用于穿透workspace文件夹中的文件结构，了解workspace文件夹中有什么内容，以便准确获取任务所需材料
-    :return: 返回文件夹的层次结构以及各文件名称
+    :return: 返回文件夹的层次结构以及各文件名称，若只返回了workspace，说明该文件夹为空
     """
     tree_str = sd.seedir(workspace,printout=False)
     return tree_str
@@ -29,14 +29,14 @@ def choose_skills(
     :return: 完成任务的所需技能
     """
     # 其实返回值没用
-    return "请求调用技能路由"
+    return demand
 
 @tool()
 def ask_user(
         query: Annotated[str, "你向用户询问的问题或者寻求确认的问题，应该总是分点询问"]
 ) -> str:
     """
-    当你对当前任务的有问题时，严禁自己猜测！总是调用该函数向用户确认。
+    对当前任务的有问题时，调用该函数向用户确认。
     在如下情况总是调用该函数：
     1、用户对任务的描述存在歧义时
     2、用户没有提供完整的任务参数时

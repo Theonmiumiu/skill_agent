@@ -12,7 +12,7 @@ def setup_logger():
     log_file_path = logs_dir / 'app.log'
 
     # 获取根日志记录器
-    logger = logging.getLogger("chat_logs")
+    logger = logging.getLogger("skill_agent")
     logger.setLevel(logging.DEBUG)  # 设置最低日志级别
 
     # 如果已经有handlers，则直接返回，避免重复添加

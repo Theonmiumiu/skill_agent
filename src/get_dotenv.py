@@ -8,5 +8,6 @@ class Config:
     ROUTER_MODEL = os.getenv('ROUTER_MODEL')
     ACTOR_MODEL = os.getenv('ACTOR_MODEL')
     PLANNER_MODEL = os.getenv('PLANNER_MODEL')
+    REPORTER_MODEL = os.getenv('REPORTER_MODEL')
 
 config = Config()
